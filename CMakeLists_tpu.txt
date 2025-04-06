@@ -1,0 +1,66 @@
+cmake_minimum_required(VERSION 3.12)
+project(llama_cpp_tpu_backend)
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Find PyTorch
+find_package(Torch REQUIRED)
+message(STATUS "Found PyTorch: ${TORCH_INCLUDE_DIRS}")
+
+# Find PyTorch/XLA
+find_path(TORCH_XLA_INCLUDE_DIR torch_xla/csrc/tensor.h
+    HINTS
+    ${TORCH_INCLUDE_DIRS}/../torch_xla
+    /usr/local/include/torch_xla
+    /usr/include/torch_xla
+)
+message(STATUS "Found PyTorch/XLA: ${TORCH_XLA_INCLUDE_DIR}")
+
+# Find llama.cpp
+find_path(LLAMA_CPP_INCLUDE_DIR llama.h
+    HINTS
+    ${CMAKE_SOURCE_DIR}/vendor/llama.cpp
+    /usr/local/include/llama.cpp
+    /usr/include/llama.cpp
+)
+message(STATUS "Found llama.cpp: ${LLAMA_CPP_INCLUDE_DIR}")
+
+# Include directories
+include_directories(
+    ${TORCH_INCLUDE_DIRS}
+    ${TORCH_XLA_INCLUDE_DIR}
+    ${LLAMA_CPP_INCLUDE_DIR}
+)
+
+# Add the TPU backend library
+add_library(llama_cpp_tpu_backend SHARED
+    llama_cpp_tpu_backend.cpp
+)
+
+# Link against PyTorch and PyTorch/XLA
+target_link_libraries(llama_cpp_tpu_backend
+    ${TORCH_LIBRARIES}
+    torch_xla
+    torch_xla_core
+    torch_xla_cpp
+    torch_xla_cpp_pjrt
+)
+
+# Set output directory
+set_target_properties(llama_cpp_tpu_backend PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
+
+# Install the library
+install(TARGETS llama_cpp_tpu_backend
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+
+# Install the header file
+install(FILES llama_cpp_tpu_backend.h
+    DESTINATION include
+)
