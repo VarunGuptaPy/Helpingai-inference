@@ -35,6 +35,27 @@ try:
 except ImportError:
     CPUINFO_AVAILABLE = False
 
+# Check for bitsandbytes availability
+try:
+    import bitsandbytes as bnb # type: ignore
+    BNB_AVAILABLE = True
+except ImportError:
+    BNB_AVAILABLE = False
+
+# Check for XLA/TPU availability
+try:
+    import torch_xla # type: ignore
+    import torch_xla.core.xla_model as xm # type: ignore
+    # Verify TPU is actually available by trying to get devices
+    try:
+        _ = xm.xla_device()
+        XLA_AVAILABLE = True
+    except Exception as e:
+        print(f"PyTorch/XLA imported but TPU not available: {e}")
+        XLA_AVAILABLE = False
+except ImportError:
+    XLA_AVAILABLE = False
+
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Depends, BackgroundTasks
@@ -58,6 +79,19 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("helpingai-server")
+
+# Import accelerate for model initialization
+try:
+    from accelerate import init_empty_weights
+except ImportError:
+    logger.warning("accelerate not installed, some features may not work")
+    logger.warning("To install: pip install accelerate")
+
+    # Provide a fallback implementation
+    from contextlib import contextmanager
+    @contextmanager
+    def init_empty_weights():
+        yield
 
 # API key header for authentication
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key")
@@ -283,7 +317,7 @@ class ServerConfig:
         # Enhanced hardware detection and configuration
         if self.device == "auto":
             logger.info("Auto-detecting optimal hardware configuration...")
-            
+
             # Check for CUDA first (NVIDIA GPU)
             if torch.cuda.is_available():
                 cuda_devices = []
@@ -295,20 +329,20 @@ class ServerConfig:
                         "total_memory": props.total_memory,
                         "compute_capability": f"{props.major}.{props.minor}"
                     })
-                    
+
                 # Log discovered CUDA devices
                 logger.info(f"Found {len(cuda_devices)} CUDA device(s):")
                 for dev in cuda_devices:
                     logger.info(f"  [{dev['index']}] {dev['name']} - {dev['total_memory'] / (1024**3):.2f} GB - Compute {dev['compute_capability']}")
-                
+
                 self.device = "cuda"
-                
+
                 # Auto-configure quantization based on available VRAM
                 best_gpu = max(cuda_devices, key=lambda x: x["total_memory"])
                 available_vram = best_gpu["total_memory"] / (1024**3)  # Convert to GB
-                
+
                 logger.info(f"Auto-configuring for {available_vram:.2f} GB VRAM")
-                
+
                 # Set quantization automatically based on VRAM
                 if available_vram < 8:
                     logger.info("Low VRAM detected (< 8GB), enabling 4-bit quantization")
@@ -318,7 +352,7 @@ class ServerConfig:
                     self.load_8bit = True
                 else:
                     logger.info(f"High VRAM detected ({available_vram:.2f}GB), using FP16")
-                
+
                 # Set appropriate device map for multi-GPU
                 if len(cuda_devices) > 1:
                     logger.info(f"Multiple GPUs detected, using automatic device map")
@@ -326,28 +360,28 @@ class ServerConfig:
                 else:
                     # For single GPU, may be better to specify the device directly
                     self.device_map = {"": 0}
-                    
+
             # Check for MPS (Apple Silicon GPU)
             elif hasattr(torch, 'has_mps') and torch.backends.mps.is_available():
                 logger.info("Apple Silicon GPU (MPS) detected")
                 self.device = "mps"
-                
+
                 # Apple Silicon specific optimizations
                 # M1/M2/M3 chip detection
                 import platform
                 import subprocess
-                
+
                 try:
                     # Get detailed Apple Silicon info
                     sysctl_output = subprocess.check_output(['sysctl', 'hw.model']).decode('utf-8').strip()
                     model_name = sysctl_output.split(':')[1].strip() if ':' in sysctl_output else "Unknown"
-                    
+
                     # Estimate memory from system info
                     memory_output = subprocess.check_output(['sysctl', 'hw.memsize']).decode('utf-8').strip()
                     system_memory = int(memory_output.split(':')[1].strip()) / (1024**3) if ':' in memory_output else 0
-                    
+
                     logger.info(f"Detected Apple Silicon device: {model_name} with ~{system_memory:.2f}GB system memory")
-                    
+
                     # Set appropriate settings based on device type
                     if "M3" in model_name or "M2" in model_name:
                         logger.info("High-performance Apple Silicon detected, using optimized settings")
@@ -355,7 +389,7 @@ class ServerConfig:
                     else:
                         logger.info("Using float16 precision for Apple Silicon")
                         self.dtype = "float16"
-                        
+
                     # Apple Silicon benefits from 4-bit quantization for larger models
                     if "gguf" in self.model_name_or_path.lower() or self.enable_gguf:
                         logger.info("Using GGUF with Metal acceleration for Apple Silicon")
@@ -363,39 +397,51 @@ class ServerConfig:
                         self.num_gpu_layers = -1  # Use all layers on MPS
                 except Exception as e:
                     logger.warning(f"Error detecting Apple Silicon details: {e}")
-                    
-            # Check for TPU 
+
+            # Check for TPU
             elif self.use_tpu or any("TPU" in env for env in os.environ if isinstance(env, str)):
-                try:
-                    import torch_xla.core.xla_model as xm # type: ignore
-                    logger.info("TPU hardware detected")
-                    self.use_tpu = True
-                    self.device = "xla"
-                    
-                    # Auto-configure TPU settings
-                    tpu_devices = xm.get_xla_supported_devices()
-                    logger.info(f"Found {len(tpu_devices)} TPU devices")
-                    
-                    # Enable appropriate TPU optimizations
-                    self.tpu_bf16 = True  # BF16 is faster on TPU
-                    
-                except ImportError:
+                if XLA_AVAILABLE:
+                    try:
+                        logger.info("TPU hardware detected")
+                        self.use_tpu = True
+                        self.device = "xla"
+
+                        # Set TPU environment variables
+                        os.environ["PJRT_DEVICE"] = "TPU"
+                        os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
+                        # Enable appropriate TPU optimizations
+                        self.tpu_bf16 = True  # BF16 is faster on TPU
+
+                        # Set TPU-specific parameters
+                        if self.tpu_layers <= 0:
+                            self.tpu_layers = -1  # Use all layers
+
+                        logger.info(f"TPU configuration: using {self.tpu_layers} layers on TPU")
+                        logger.info(f"TPU precision: {'BF16' if self.tpu_bf16 else 'default'}")
+
+                    except Exception as e:
+                        logger.warning(f"TPU environment detected but error initializing: {e}")
+                        self.use_tpu = False
+                        self.device = "cpu"
+                else:
                     logger.warning("TPU environment detected but torch_xla not available")
+                    logger.warning("Install with: pip install torch_xla")
                     self.use_tpu = False
                     self.device = "cpu"
-            
+
             # Fallback to CPU with optimal threading
             else:
                 import multiprocessing
                 cpu_count = multiprocessing.cpu_count()
                 logger.info(f"No GPU/TPU detected. Using CPU with {cpu_count} cores")
                 self.device = "cpu"
-                
+
                 # Set number of threads for CPU inference
                 if hasattr(torch, 'set_num_threads'):
                     torch.set_num_threads(cpu_count)
                     logger.info(f"Set PyTorch to use {cpu_count} threads")
-                
+
                 # For CPU, smaller models or GGUF is recommended
                 logger.info("For CPU inference, GGUF models are recommended for better performance")
                 if not self.enable_gguf and "gguf" not in self.model_name_or_path.lower():
@@ -448,7 +494,7 @@ class ServerConfig:
         if not self.use_tpu and self.device == "mps":
             if hasattr(torch, 'has_mps') and torch.has_mps and torch.backends.mps.is_available():
                 logger.info("MPS (Apple Silicon GPU) is available and will be used")
-                
+
                 # Set Metal environment variables for optimal performance with GGUF
                 if self.enable_gguf:
                     os.environ["GGML_METAL_ENABLE"] = "1"
@@ -457,17 +503,17 @@ class ServerConfig:
             else:
                 logger.warning("MPS (Apple Silicon GPU) requested but not available, falling back to CPU")
                 self.device = "cpu"
-        
+
         # Check for CUDA
         elif not self.use_tpu and self.device == "cuda" and not torch.cuda.is_available():
             logger.warning("CUDA not available, falling back to CPU")
             self.device = "cpu"
-        
+
         # Log final device configuration
         logger.info(f"Final device configuration: {self.device}")
         if self.device == "cuda":
             logger.info(f"CUDA configuration: 4-bit={self.load_4bit}, 8-bit={self.load_8bit}, fp16={(self.dtype == 'float16')}")
-        
+
         # Log GGUF configuration
         if self.enable_gguf:
             logger.info(f"GGUF enabled: using {'downloaded' if self.download_gguf else 'local'} model, GPU layers={self.num_gpu_layers}")
@@ -559,7 +605,7 @@ def load_model(config: ServerConfig):
             else:
                 # Last resort for models without eos token
                 tokenizer.pad_token = tokenizer.unk_token or "<|padding|>"
-                
+
         # Report on tokenizer capabilities
         has_chat_template = hasattr(tokenizer, "chat_template") and tokenizer.chat_template is not None
         logger.info(f"Tokenizer loaded successfully from {config.tokenizer_name_or_path}. Chat template: {'Available' if has_chat_template else 'Not available'}")
@@ -579,7 +625,7 @@ def load_model(config: ServerConfig):
         if is_gguf_model:
             logger.info(f"Auto-detected GGUF model format from model name: {model_id}")
             config.enable_gguf = True
-            
+
     # Handle GGUF model path - download from HF if requested
     gguf_path = config.gguf_path
     if config.download_gguf or (config.enable_gguf and not gguf_path):
@@ -618,87 +664,95 @@ def load_model(config: ServerConfig):
                 # Configure for CUDA
                 gguf_kwargs["n_gpu_layers"] = config.num_gpu_layers
                 gguf_kwargs["use_mlock"] = True  # Helps with GPU memory management
-                
+
                 # Get CUDA device properties for better configuration
                 props = torch.cuda.get_device_properties(0)
                 cuda_compute_capability = f"{props.major}.{props.minor}"
-                
+
                 # Set GGML CUDA parameters based on GPU capabilities
                 os.environ["GGML_CUDA_CAPABILITY"] = cuda_compute_capability
-                
+
                 # For newer GPUs with Tensor Cores, enable them
                 if float(cuda_compute_capability) >= 7.0:
                     os.environ["GGML_CUDA_TENSOR_CORES"] = "1"
-                
+
                 logger.info(f"Configuring GGUF model for CUDA GPU with compute capability {cuda_compute_capability}")
                 logger.info(f"Using {config.num_gpu_layers} layers on GPU")
-                
+
             elif config.device == "mps":
                 # Configure for Apple Silicon (Metal)
                 logger.info("Configuring GGUF model for Apple Silicon GPU (Metal)")
-                
+
                 # Enable Metal acceleration
                 os.environ["GGML_METAL_ENABLE"] = "1"
                 gguf_kwargs["use_mlock"] = True
                 gguf_kwargs["n_gpu_layers"] = config.num_gpu_layers if config.num_gpu_layers > 0 else -1
-                
+
                 # Performance optimizations for Metal
                 os.environ["GGML_METAL_NDEBUGGROUPS"] = "32"  # Performance optimization
-                
+
                 logger.info(f"Metal acceleration enabled with {config.num_gpu_layers if config.num_gpu_layers > 0 else 'all'} layers")
-                
+
             elif config.use_tpu:
                 # TPU-specific configuration for GGUF
                 logger.info("Configuring GGUF model for TPU")
-                gguf_kwargs["n_gpu_layers"] = config.num_gpu_layers if config.num_gpu_layers > 0 else -1
-                gguf_kwargs["use_mlock"] = True
-                gguf_kwargs["use_tpu"] = True
+                gguf_kwargs["n_gpu_layers"] = config.tpu_layers if config.tpu_layers > 0 else -1
+                gguf_kwargs["use_mlock"] = False  # mlock not needed for TPU
 
                 # Set environment variables for TPU support
-                os.environ["GGML_TPU_ENABLE"] = "1"
-                os.environ["GGML_TPU_LAYERS"] = str(config.num_gpu_layers if config.num_gpu_layers > 0 else -1)
+                os.environ["PJRT_DEVICE"] = "TPU"
+                os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-                logger.info(f"TPU configuration: using {config.num_gpu_layers if config.num_gpu_layers > 0 else 'all'} layers on TPU")
+                # Use BF16 precision if requested (better for TPU)
+                if config.tpu_bf16:
+                    os.environ["GGML_TPU_BF16"] = "1"
+
+                logger.info(f"TPU configuration: using {config.tpu_layers if config.tpu_layers > 0 else 'all'} layers on TPU")
+                logger.info(f"TPU precision: {'BF16' if config.tpu_bf16 else 'default'}")
             else:
                 # CPU configuration with performance optimizations
                 import multiprocessing
                 num_threads = os.cpu_count() or multiprocessing.cpu_count()
                 gguf_kwargs["n_threads"] = num_threads
-                
+
                 # Check for AVX/AVX2/AVX512 support for better performance
-                import cpuinfo # type: ignore
-                try:
-                    cpu_info = cpuinfo.get_cpu_info()
-                    cpu_flags = cpu_info.get('flags', [])
-                    
-                    # Log CPU capabilities
-                    cpu_features = []
-                    if 'avx512f' in cpu_flags:
-                        cpu_features.append('AVX-512')
-                        os.environ["GGML_AVX512"] = "1"
-                    if 'avx2' in cpu_flags:
-                        cpu_features.append('AVX2')
-                        os.environ["GGML_AVX2"] = "1"
-                    elif 'avx' in cpu_flags:
-                        cpu_features.append('AVX')
-                        os.environ["GGML_AVX"] = "1"
-                    
-                    if cpu_features:
-                        logger.info(f"CPU supports {', '.join(cpu_features)} instructions")
-                    
-                except Exception as e:
-                    logger.warning(f"Could not detect CPU features: {e}")
-                
+                if CPUINFO_AVAILABLE:
+                    try:
+                        import cpuinfo # type: ignore
+                        cpu_info = cpuinfo.get_cpu_info()
+                        cpu_flags = cpu_info.get('flags', [])
+
+                        # Log CPU capabilities
+                        cpu_features = []
+                        if 'avx512f' in cpu_flags:
+                            cpu_features.append('AVX-512')
+                            os.environ["GGML_AVX512"] = "1"
+                        if 'avx2' in cpu_flags:
+                            cpu_features.append('AVX2')
+                            os.environ["GGML_AVX2"] = "1"
+                        elif 'avx' in cpu_flags:
+                            cpu_features.append('AVX')
+                            os.environ["GGML_AVX"] = "1"
+
+                        if cpu_features:
+                            logger.info(f"CPU supports {', '.join(cpu_features)} instructions")
+
+                    except Exception as e:
+                        logger.warning(f"Could not detect CPU features: {e}")
+                    else:
+                        logger.info("py-cpuinfo not installed, skipping CPU feature detection")
+                        logger.info("Install with: pip install py-cpuinfo for better CPU performance")
+
                 logger.info(f"Configuring GGUF model for CPU with {num_threads} threads")
 
             # Add GGUF-specific parameters for optimal performance
-            
+
             # Set batch size based on device
             if config.device == "cuda" or config.device == "mps":
                 gguf_kwargs["n_batch"] = 512  # Larger batch size for GPU
             else:
                 gguf_kwargs["n_batch"] = 256  # Smaller batch size for CPU
-                
+
             # Load the GGUF model
             logger.info(f"Creating GGUF model instance with parameters: {gguf_kwargs}")
             model = Llama(**gguf_kwargs)
@@ -715,7 +769,7 @@ def load_model(config: ServerConfig):
     # Transformers path if not using GGUF
     if not config.enable_gguf or (config.enable_gguf and not gguf_path):
         logger.info("Loading model with Transformers")
-        
+
         # Set up device-specific configurations
         if config.use_tpu:
             try:
@@ -752,31 +806,31 @@ def load_model(config: ServerConfig):
         # Add quantization options if specified
         if config.load_8bit:
             logger.info("Loading model in 8-bit quantization")
-            try:
-                import bitsandbytes as bnb # type: ignore
+            if BNB_AVAILABLE:
                 model_kwargs["load_in_8bit"] = True
                 model_kwargs["llm_int8_enable_fp32_cpu_offload"] = True
-            except ImportError:
+                logger.info("Using bitsandbytes for 8-bit quantization")
+            else:
                 logger.warning("8-bit quantization requested but bitsandbytes not available")
                 logger.warning("To enable 8-bit: pip install bitsandbytes")
                 config.load_8bit = False
 
         if config.load_4bit:
             logger.info("Loading model in 4-bit quantization")
-            try:
-                import bitsandbytes as bnb # type: ignore
+            if BNB_AVAILABLE:
                 model_kwargs["load_in_4bit"] = True
                 model_kwargs["bnb_4bit_compute_dtype"] = torch.float16
                 model_kwargs["bnb_4bit_quant_type"] = "nf4"
                 model_kwargs["bnb_4bit_use_double_quant"] = True
-            except ImportError:
+                logger.info("Using bitsandbytes for 4-bit quantization")
+            else:
                 logger.warning("4-bit quantization requested but bitsandbytes not available")
                 logger.warning("To enable 4-bit: pip install bitsandbytes")
                 config.load_4bit = False
-                
+
         # Add trust_remote_code for models that need it
         model_kwargs["trust_remote_code"] = True
-                
+
         # Add low_cpu_mem_usage for better memory management during loading
         model_kwargs["low_cpu_mem_usage"] = True
 
@@ -802,14 +856,14 @@ def load_model(config: ServerConfig):
             logger.info(f"Model loaded successfully on {config.device} in {time.time() - start_time:.2f} seconds")
         except Exception as e:
             logger.error(f"Error loading model with transformers: {e}")
-            
+
             # Try to provide helpful error messages based on common issues
             if "CUDA out of memory" in str(e):
                 logger.error("GPU out of memory error. Try using --load-8bit or --load-4bit to reduce memory usage.")
             elif "Cannot handle type" in str(e) and config.device == "mps":
                 logger.error("MPS compatibility issue. Apple Silicon may not support all model operations.")
                 logger.error("Try using --device cpu or using a GGUF model with --enable-gguf.")
-            
+
             raise
 
     # Cache the model and tokenizer for future use
@@ -1595,18 +1649,18 @@ def main():
     # Apply auto-configuration if requested
     if args.auto_configure:
         logger.info("Auto-configure flag detected, performing hardware detection...")
-        
+
         # Check for CUDA (NVIDIA GPU)
         if torch.cuda.is_available():
             logger.info("NVIDIA GPU detected, configuring for optimal performance")
             args.device = "cuda"
-            
+
             # Get GPU memory to determine quantization
             try:
                 props = torch.cuda.get_device_properties(0)
                 gpu_memory_gb = props.total_memory / (1024**3)
                 logger.info(f"GPU: {props.name} with {gpu_memory_gb:.2f}GB VRAM")
-                
+
                 # Auto-configure based on available VRAM
                 if gpu_memory_gb < 8:
                     logger.info("Low VRAM GPU detected, enabling 4-bit quantization")
@@ -1616,68 +1670,68 @@ def main():
                     args.load_8bit = True
                 else:
                     logger.info(f"High VRAM GPU detected ({gpu_memory_gb:.2f}GB), using FP16")
-                    
+
                 # Set compute capability-specific optimizations
                 compute_capability = f"{props.major}.{props.minor}"
                 logger.info(f"CUDA Compute Capability: {compute_capability}")
-                
+
                 # For multi-GPU systems, use device map
                 if torch.cuda.device_count() > 1:
                     logger.info(f"Multiple GPUs detected ({torch.cuda.device_count()}), using auto device map")
                     args.device_map = "auto"
             except Exception as e:
                 logger.warning(f"Error during GPU detection: {e}")
-                
+
         # Check for Apple Silicon (MPS)
         elif hasattr(torch, 'has_mps') and torch.backends.mps.is_available():
             logger.info("Apple Silicon GPU detected, configuring for MPS")
             args.device = "mps"
-            
+
             # For Apple Silicon, GGUF with Metal is often best
             logger.info("Recommending GGUF with Metal for Apple Silicon")
             if not args.enable_gguf and "gguf" not in args.model.lower():
                 logger.info("Auto-enabling GGUF for better performance on Apple Silicon")
                 args.enable_gguf = True
-                
+
                 # If no specific GGUF file is specified but we're downloading, suggest a good default
                 if args.download_gguf and not args.gguf_filename:
                     logger.info("Auto-selecting a 4-bit quantization GGUF file for best performance")
                     # Look for a 4-bit quantized version as a good default
                     args.gguf_filename = "model-q4_k_m.gguf"
-        
-        # Check for TPU  
+
+        # Check for TPU
         elif os.environ.get("TPU_NAME") or os.environ.get("COLAB_TPU_ADDR"):
             logger.info("Google Cloud TPU environment detected")
-            try:
-                import torch_xla # type: ignore
-                logger.info("TPU support confirmed, enabling TPU mode")
+            if XLA_AVAILABLE:
+                logger.info("TPU support confirmed with torch_xla, enabling TPU mode")
                 args.use_tpu = True
                 args.device = "xla"
-            except ImportError:
+            else:
                 logger.warning("TPU environment detected but torch_xla not installed")
                 logger.warning("Install with: pip install torch_xla")
-        
+                args.device = "cpu"
+
         # Fallback to CPU
         else:
             logger.info("No GPU/TPU detected, configuring for CPU")
             args.device = "cpu"
-            
+
             # For CPU inference, GGUF is strongly recommended
             logger.info("For CPU inference, GGUF models are recommended for performance")
             if not args.enable_gguf and "gguf" not in args.model.lower():
                 logger.info("Auto-enabling GGUF for CPU inference")
                 args.enable_gguf = True
                 args.download_gguf = True
-                
+
                 # If no specific GGUF file is specified but we're downloading, suggest a good default
                 if not args.gguf_filename:
                     logger.info("Auto-selecting a 4-bit quantization GGUF file for CPU")
                     args.gguf_filename = "model-q4_k_m.gguf"
-    
+
     # Enhanced model path handling - check if the model is a local path or HF model ID
     if not args.model.startswith(("https://", "http://")) and "/" in args.model and not os.path.exists(args.model):
         logger.info(f"Model path looks like a Hugging Face model ID: {args.model}")
-        
+
         # If GGUF is enabled but no filename specified, try to auto-detect common GGUF filenames
         if args.enable_gguf and args.download_gguf and not args.gguf_filename:
             logger.info("Auto-detecting GGUF filename for the model")
@@ -1690,15 +1744,15 @@ def main():
                 "ggml-model-q4_k.gguf",
                 "ggml-model-q5_k.gguf",
             ]
-            
+
             # For Apple Silicon, suggest Metal-optimized GGUF files if available
             if args.device == "mps":
                 common_gguf_files = ["model-q4_k_m.gguf", "model-q5_k_m.gguf"] + common_gguf_files
-                
+
             # For CPU, prioritize smallest files
             if args.device == "cpu":
                 common_gguf_files = ["model-q4_0.gguf", "model-q4_k_m.gguf"] + common_gguf_files
-            
+
             # Try to check which GGUF files exist for this model
             try:
                 api_url = f"https://huggingface.co/api/models/{args.model}"
@@ -1707,10 +1761,10 @@ def main():
                     model_info = response.json()
                     siblings = model_info.get("siblings", [])
                     available_files = [s["rfilename"] for s in siblings]
-                    
+
                     # Filter for GGUF files
                     gguf_files = [f for f in available_files if f.endswith('.gguf')]
-                    
+
                     if gguf_files:
                         # Log available GGUF files
                         logger.info(f"Found {len(gguf_files)} GGUF files for this model")
@@ -1718,14 +1772,14 @@ def main():
                             logger.info(f"  - {file}")
                         if len(gguf_files) > 5:
                             logger.info(f"  ... and {len(gguf_files) - 5} more")
-                        
+
                         # Try to find a good match from common files
                         for common_file in common_gguf_files:
                             if common_file in gguf_files:
                                 args.gguf_filename = common_file
                                 logger.info(f"Auto-selected GGUF file: {common_file}")
                                 break
-                        
+
                         # If no match found, use the first available GGUF file
                         if not args.gguf_filename:
                             args.gguf_filename = gguf_files[0]
