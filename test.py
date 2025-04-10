@@ -60,9 +60,38 @@ try:
     # Verify TPU is actually available by trying to get devices
     try:
         print("Attempting to initialize TPU device...")
-        _ = xm.xla_device()
-        print("Successfully initialized TPU device")
-        XLA_AVAILABLE = True
+        # Add a timeout mechanism using threading
+        import threading
+        import queue
+
+        result_queue = queue.Queue()
+
+        def init_tpu_with_timeout():
+            try:
+                device = xm.xla_device()
+                result_queue.put((True, device))
+            except Exception as e:
+                result_queue.put((False, str(e)))
+
+        # Start TPU initialization in a separate thread
+        tpu_thread = threading.Thread(target=init_tpu_with_timeout)
+        tpu_thread.daemon = True
+        tpu_thread.start()
+
+        # Wait for initialization with timeout
+        try:
+            success, result = result_queue.get(timeout=10)  # 10 second timeout
+            if success:
+                print(f"Successfully initialized TPU device: {result}")
+                XLA_AVAILABLE = True
+            else:
+                print(f"PyTorch/XLA imported but TPU not available: {result}")
+                print("You can use --tpu-compatibility-mode to automatically fall back to CPU")
+                XLA_AVAILABLE = False
+        except queue.Empty:
+            print("TPU initialization timed out after 10 seconds. This is a known issue with some TPU configurations.")
+            print("You can use --tpu-compatibility-mode to automatically fall back to CPU")
+            XLA_AVAILABLE = False
     except Exception as e:
         print(f"PyTorch/XLA imported but TPU not available: {e}")
         XLA_AVAILABLE = False
@@ -323,6 +352,7 @@ class ServerConfig:
     tpu_layers: int = -1
     tpu_bf16: bool = True
     tpu_memory_limit: str = "1GB"
+    tpu_compatibility_mode: bool = False
 
     def __post_init__(self):
         if self.tokenizer_name_or_path is None:
@@ -801,9 +831,47 @@ def load_model(config: ServerConfig):
                 # Disable bitsandbytes as it's incompatible with TPU
                 os.environ["BITSANDBYTES_NOWELCOME"] = "1"  # Disable welcome message
 
-                # Create TPU device
-                device = xm.xla_device()
-                logger.info(f"TPU device initialized: {device}")
+                # Create TPU device with timeout
+                import queue
+                result_queue = queue.Queue()
+
+                def init_tpu_with_timeout():
+                    try:
+                        device = xm.xla_device()
+                        result_queue.put((True, device))
+                    except Exception as e:
+                        result_queue.put((False, str(e)))
+
+                # Start TPU initialization in a separate thread
+                tpu_thread = threading.Thread(target=init_tpu_with_timeout)
+                tpu_thread.daemon = True
+                tpu_thread.start()
+
+                # Wait for initialization with timeout
+                try:
+                    success, result = result_queue.get(timeout=10)  # 10 second timeout
+                    if success:
+                        device = result
+                        logger.info(f"TPU device initialized: {device}")
+                    else:
+                        if config.tpu_compatibility_mode:
+                            logger.warning(f"TPU initialization failed: {result}")
+                            logger.warning("TPU compatibility mode enabled, falling back to CPU")
+                            config.use_tpu = False
+                            config.device = "cpu"
+                            raise Exception("TPU initialization failed, using compatibility mode")
+                        else:
+                            raise Exception(f"TPU initialization failed: {result}")
+                except queue.Empty:
+                    logger.error("TPU initialization timed out after 10 seconds.")
+                    logger.error("This is a known issue with some TPU configurations.")
+                    if config.tpu_compatibility_mode:
+                        logger.warning("TPU compatibility mode enabled, falling back to CPU")
+                        config.use_tpu = False
+                        config.device = "cpu"
+                        raise Exception("TPU initialization timed out, using compatibility mode")
+                    else:
+                        raise Exception("TPU initialization timed out")
 
                 model_kwargs = {
                     "device_map": None,  # Don't use device_map with TPU
@@ -1626,6 +1694,8 @@ def main():
                       help="Path to tokenizer (defaults to model path)")
     model_group.add_argument("--tokenizer-revision", type=str, default=None,
                       help="Specific tokenizer revision to load")
+    model_group.add_argument("--tpu-compatibility-mode", action="store_true",
+                      help="Enable TPU compatibility mode (skips TPU initialization if it takes too long)")
 
     # Server parameters
     server_group = parser.add_argument_group("Server Configuration")
@@ -1860,6 +1930,7 @@ def main():
         tpu_layers=args.tpu_layers,
         tpu_bf16=args.tpu_bf16,
         tpu_memory_limit=args.tpu_memory_limit,
+        tpu_compatibility_mode=args.tpu_compatibility_mode,
     )
 
     # Create the FastAPI app
