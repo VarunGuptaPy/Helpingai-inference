@@ -37,8 +37,18 @@ except ImportError:
 
 # Check for bitsandbytes availability
 try:
-    import bitsandbytes as bnb # type: ignore
-    BNB_AVAILABLE = True
+    # Check if we're in a TPU environment first
+    tpu_env = any("TPU" in env for env in os.environ if isinstance(env, str))
+    if tpu_env:
+        # In TPU environment, we need to be careful with bitsandbytes
+        print("TPU environment detected, setting bitsandbytes compatibility mode")
+        os.environ["BITSANDBYTES_NOWELCOME"] = "1"  # Disable welcome message
+        # We'll mark it as unavailable to avoid issues
+        BNB_AVAILABLE = False
+    else:
+        # Normal import for non-TPU environments
+        import bitsandbytes as bnb # type: ignore
+        BNB_AVAILABLE = True
 except ImportError:
     BNB_AVAILABLE = False
 
@@ -46,14 +56,18 @@ except ImportError:
 try:
     import torch_xla # type: ignore
     import torch_xla.core.xla_model as xm # type: ignore
+    print("Successfully imported torch_xla and xla_model")
     # Verify TPU is actually available by trying to get devices
     try:
+        print("Attempting to initialize TPU device...")
         _ = xm.xla_device()
+        print("Successfully initialized TPU device")
         XLA_AVAILABLE = True
     except Exception as e:
         print(f"PyTorch/XLA imported but TPU not available: {e}")
         XLA_AVAILABLE = False
-except ImportError:
+except ImportError as e:
+    print(f"Failed to import torch_xla: {e}")
     XLA_AVAILABLE = False
 
 import torch
@@ -407,8 +421,15 @@ class ServerConfig:
                         self.device = "xla"
 
                         # Set TPU environment variables
+                        logger.info("Setting TPU environment variables")
                         os.environ["PJRT_DEVICE"] = "TPU"
                         os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
+                        # Disable bitsandbytes as it's incompatible with TPU
+                        logger.info("Disabling bitsandbytes for TPU compatibility")
+                        os.environ["BITSANDBYTES_NOWELCOME"] = "1"  # Disable welcome message
+                        self.load_8bit = False
+                        self.load_4bit = False
 
                         # Enable appropriate TPU optimizations
                         self.tpu_bf16 = True  # BF16 is faster on TPU
@@ -422,6 +443,7 @@ class ServerConfig:
 
                     except Exception as e:
                         logger.warning(f"TPU environment detected but error initializing: {e}")
+                        logger.warning(f"TPU initialization error details: {str(e)}")
                         self.use_tpu = False
                         self.device = "cpu"
                 else:
@@ -774,14 +796,26 @@ def load_model(config: ServerConfig):
         if config.use_tpu:
             try:
                 import torch_xla.core.xla_model as xm # type: ignore
+                logger.info("Initializing TPU device for model loading...")
+
+                # Disable bitsandbytes as it's incompatible with TPU
+                os.environ["BITSANDBYTES_NOWELCOME"] = "1"  # Disable welcome message
+
+                # Create TPU device
                 device = xm.xla_device()
+                logger.info(f"TPU device initialized: {device}")
+
                 model_kwargs = {
                     "device_map": None,  # Don't use device_map with TPU
                     "torch_dtype": torch.bfloat16,  # bfloat16 is preferred for TPU
+                    "low_cpu_mem_usage": True,  # Important for TPU
                 }
                 logger.info("Using TPU configuration for model loading")
-            except ImportError:
-                logger.warning("TPU support requested but torch_xla not available, using CPU/GPU configuration")
+            except Exception as e:
+                logger.warning(f"TPU initialization error: {e}")
+                logger.warning("Falling back to CPU configuration")
+                config.use_tpu = False
+                config.device = "cpu"
                 model_kwargs = {
                     "device_map": config.device_map,
                     "torch_dtype": torch.float16 if config.dtype == "float16" else torch.float32,
@@ -850,8 +884,19 @@ def load_model(config: ServerConfig):
                 logger.info("Model moved to MPS device")
             # Move model to TPU if using TPU
             elif config.use_tpu and 'device' in locals():
-                logger.info("Moving model to TPU device")
-                model = model.to(device)
+                try:
+                    logger.info("Moving model to TPU device")
+                    # Disable bitsandbytes as it's incompatible with TPU
+                    os.environ["BITSANDBYTES_NOWELCOME"] = "1"  # Disable welcome message
+                    # Move model to TPU device
+                    model = model.to(device)
+                    logger.info("Model successfully moved to TPU device")
+                except Exception as e:
+                    logger.error(f"Error moving model to TPU: {e}")
+                    logger.error("Falling back to CPU")
+                    config.use_tpu = False
+                    config.device = "cpu"
+                    model = model.to("cpu")
 
             logger.info(f"Model loaded successfully on {config.device} in {time.time() - start_time:.2f} seconds")
         except Exception as e:
