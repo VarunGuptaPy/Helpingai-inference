@@ -373,7 +373,7 @@ class ServerConfig:
                     self.device_map = {"": 0}
 
             # Check for MPS (Apple Silicon GPU)
-            elif hasattr(torch, 'has_mps') and torch.backends.mps.is_available():
+            elif torch.backends.mps.is_built() and torch.backends.mps.is_available():
                 logger.info("Apple Silicon GPU (MPS) detected")
                 self.device = "mps"
 
@@ -875,7 +875,7 @@ def load_model(config: ServerConfig):
             )
 
             # Move model to MPS if using MPS
-            if config.device == "mps" and hasattr(torch, 'has_mps') and torch.has_mps and torch.backends.mps.is_available():
+            if config.device == "mps" and torch.backends.mps.is_built() and torch.backends.mps.is_available():
                 logger.info("Moving model to MPS device")
                 model = model.to(torch.device("mps"))
                 logger.info("Model moved to MPS device")
